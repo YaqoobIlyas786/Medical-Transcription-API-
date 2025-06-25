@@ -1,0 +1,16 @@
+# Core FastAPI and server dependencies
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+
+# HTTP client for API calls
+aiohttp>=3.9.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# File handling and uploads
+python-multipart>=0.0.6
+
+# Additional useful packages
+requests>=2.31.0
