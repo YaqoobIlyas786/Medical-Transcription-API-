@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --log-level debug --access-log
     envVars:
       - key: DEEPGRAM_API_KEY
         sync: false
@@ -12,5 +12,9 @@ services:
         sync: false
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: ENVIRONMENT
+        value: "production"
+      - key: LOG_LEVEL
+        value: "DEBUG"
     healthCheckPath: /health
     autoDeploy: false

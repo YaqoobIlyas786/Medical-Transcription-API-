@@ -8,8 +8,31 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.DEBUG)
+import sys
+
+# Configure logging for both local and cloud deployment
+log_level = logging.DEBUG if os.getenv("ENVIRONMENT") != "production" else logging.INFO
+
+# Configure logging to work with cloud platforms
+logging.basicConfig(
+    level=log_level,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Ensure logs go to stdout for cloud platforms
+    ]
+)
+
+# Set specific loggers
 logger = logging.getLogger("server")
+uvicorn_logger = logging.getLogger("uvicorn")
+uvicorn_logger.setLevel(log_level)
+
+# Ensure aiohttp and other libraries don't flood logs in production
+if os.getenv("ENVIRONMENT") == "production":
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("multipart").setLevel(logging.WARNING)
+else:
+    logging.getLogger("aiohttp").setLevel(logging.INFO)
 
 # ─── Load API Keys ────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -90,10 +113,29 @@ async def health_check():
     """
     Health check endpoint to verify the API is running.
     """
+    logger.info("Health check endpoint accessed")
     return {
         "status": "healthy",
         "timestamp": "2025-06-25",
         "api_version": "1.0.0"
+    }
+
+# ─── Logging Test Endpoint ─────────────────────────────────────────────────────
+@app.get("/test-logs")
+async def test_logs():
+    """
+    Test endpoint to verify logging is working in production.
+    """
+    logger.debug("DEBUG: This is a debug message")
+    logger.info("INFO: This is an info message")
+    logger.warning("WARNING: This is a warning message")
+    logger.error("ERROR: This is an error message")
+    
+    return {
+        "status": "logs_tested",
+        "message": "Check your deployment logs to see if these messages appear",
+        "timestamp": "2025-06-26",
+        "environment": os.getenv("ENVIRONMENT", "local")
     }
 
 # ─── Transcribe Audio Using Deepgram ───────────────────────────────────────────────
@@ -410,7 +452,9 @@ if __name__ == "__main__":
         "main:app", 
         host=host, 
         port=port, 
-        log_level="info", 
+        log_level="debug" if os.getenv("ENVIRONMENT") != "production" else "info",
         reload=False,  # Disable reload for production
-        access_log=True
+        access_log=True,
+        use_colors=False,  # Disable colors for cloud logs
+        loop="asyncio"  # Specify event loop for better cloud compatibility
     )
