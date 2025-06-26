@@ -135,7 +135,7 @@ async def root():
         "version": "1.0.0",
         "status": "active",
         "endpoints": {
-            "POST /transcribe_audio": "Upload audio file for transcription with speaker diarization",
+            "POST /transcribe_audio": "Upload audio file for transcription (auto-optimized for production)",
             "POST /classify_speakers": "Classify speakers as Doctor/Patient in transcription",
             "POST /classify_or_summarize": "Get clinical summary and classification",
             "POST /generate_soap": "Generate SOAP notes from transcription"
@@ -180,71 +180,21 @@ async def test_logs():
 async def transcribe_audio(file: UploadFile = File(...)):
     """
     Endpoint to receive audio file and perform transcription via Deepgram with speaker diarization.
-    Supports multiple audio formats including compressed formats.
+    Optimized for maximum speed in production with detailed logging in development.
     """
     import time
-    import asyncio
     
-    # Log immediately when endpoint is hit
-    start_time = time.time()
-    endpoint_start = time.strftime('%H:%M:%S.%f')[:-3]
-    logger.info("=== AUDIO PROCESSING STARTED ===")
-    logger.info(f"Endpoint hit at: {endpoint_start}")
-    logger.info(f"Request received for file: {file.filename}")
-    logger.info(f"Content type: {file.content_type}")
+    # Check if we're in production mode for speed optimization
+    is_production = os.getenv("ENVIRONMENT") == "production"
     
-    try:
-        # Check file size before reading (if available)
-        file_size = getattr(file, 'size', None)
-        if file_size:
-            logger.info(f"File size from header: {file_size / (1024*1024):.2f} MB")
-        
-        # Read file in chunks to track progress
-        logger.info("Starting file read with progress tracking...")
-        read_start = time.time()
-        
-        chunk_size = 1024 * 1024  # 1MB chunks
-        audio_content = bytearray()
-        bytes_read = 0
-        
-        while True:
-            chunk = await file.read(chunk_size)
-            if not chunk:
-                break
-            
-            audio_content.extend(chunk)
-            bytes_read += len(chunk)
-            
-            # Log progress every 5MB
-            if bytes_read % (5 * 1024 * 1024) == 0:
-                elapsed = time.time() - read_start
-                speed = (bytes_read / (1024*1024)) / elapsed if elapsed > 0 else 0
-                logger.info(f"Read {bytes_read/(1024*1024):.1f}MB so far, speed: {speed:.1f}MB/s")
-        
-        read_end = time.time()
-        file_size_mb = len(audio_content) / (1024 * 1024)
-        read_time = read_end - read_start
-        
-        logger.info(f"✅ File read completed!")
-        logger.info(f"📁 Total file size: {file_size_mb:.2f} MB ({len(audio_content):,} bytes)")
-        logger.info(f"⏱️  Read time: {read_time:.2f} seconds")
-        logger.info(f"🚀 Read speed: {file_size_mb/read_time:.2f} MB/s")
-        
-        # Log total time from endpoint call to file ready
-        total_time = time.time() - start_time
-        logger.info(f"⚡ Total time from endpoint call to file ready: {total_time:.2f} seconds")
-        
-        if total_time > 10:
-            logger.warning(f"⚠️  Slow upload detected: {total_time:.2f}s - check network connection")
+    if not is_production:
+        # Development mode - detailed logging
+        start_time = time.time()
+        logger.info("=== AUDIO PROCESSING STARTED ===")
+        logger.info(f"🚀 Processing file: {file.filename}")
+        logger.info(f"📋 Content type: {file.content_type}")
     
-    except Exception as e:
-        logger.error(f"❌ Error reading file: {e}")
-        raise HTTPException(status_code=500, detail=f"Error reading uploaded file: {str(e)}")
-    
-    # Convert back to bytes for processing
-    audio_content = bytes(audio_content)
-    
-    # Determine audio format and set appropriate content type for Deepgram
+    # Determine audio format quickly
     content_type = "audio/wav"  # Default
     if file.filename:
         if file.filename.endswith('.webm'):
@@ -256,76 +206,101 @@ async def transcribe_audio(file: UploadFile = File(...)):
         elif file.filename.endswith('.flac'):
             content_type = "audio/flac"
     
-    logger.info(f"Using content type for Deepgram: {content_type}")
-
-    # Send audio content to Deepgram for transcription with diarization
-    timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout for long audio files
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        headers = {
-            "Authorization": f"Token {DEEPGRAM_API_KEY}",
-            "Content-Type": content_type
-        }
-
-        logger.info("Sending request to Deepgram...")
-        async with session.post(DEEPGRAM_API_URL, headers=headers, data=audio_content) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                logger.error(f"Error with Deepgram API response: {response.status}, {error_text}")
-                raise HTTPException(status_code=500, detail=f"Error transcribing audio: {error_text}")
+    if not is_production:
+        logger.info(f"🔧 Using content type: {content_type}")
+    
+    try:
+        # Production optimized streaming
+        if not is_production:
+            logger.info("📡 Streaming to Deepgram...")
+            stream_start = time.time()
+        
+        timeout = aiohttp.ClientTimeout(total=180 if is_production else 300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            headers = {
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": content_type
+            }
             
-            data = await response.json()
-            logger.info(f"Deepgram response received, processing...")
-            logger.debug(f"Full Deepgram response: {json.dumps(data, indent=2)}")
-
-            # Extract diarized transcription
-            try:
-                results = data.get("results", {})
-                channels = results.get("channels", [])
-                
-                if not channels:
-                    raise HTTPException(status_code=500, detail="No transcription channels found")
-                
-                # Get the utterances (speaker-separated segments)
-                utterances = results.get("utterances", [])
-                
-                if utterances:
-                    # Format the transcription with speaker labels
-                    formatted_transcription = ""
-                    logger.info(f"Found {len(utterances)} utterances")
-                    for i, utterance in enumerate(utterances):
-                        speaker = utterance.get("speaker", 0)
-                        transcript = utterance.get("transcript", "").strip()
-                        start_time = utterance.get("start", 0)
-                        end_time = utterance.get("end", 0)
+            # Ultra-fast streaming for production, detailed tracking for development
+            if is_production:
+                # Production: Maximum speed, minimal logging
+                async def file_stream():
+                    while chunk := await file.read(16384):  # 16KB chunks for speed
+                        yield chunk
+            else:
+                # Development: Progress tracking
+                async def file_stream():
+                    total_bytes = 0
+                    chunk_count = 0
+                    while True:
+                        chunk = await file.read(8192)  # 8KB chunks
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        chunk_count += 1
                         
-                        if transcript:
-                            formatted_transcription += f"Speaker {speaker}: {transcript}\n"
-                            logger.debug(f"Utterance {i}: Speaker {speaker} ({start_time:.2f}s-{end_time:.2f}s): {transcript[:50]}...")
+                        # Log every 100 chunks (approximately every 800KB)
+                        if chunk_count % 100 == 0:
+                            logger.info(f"📤 Streamed {total_bytes/(1024*1024):.1f}MB...")
+                        
+                        yield chunk
                     
-                    if not formatted_transcription:
-                        # Fallback to regular transcription
+                    logger.info(f"✅ Stream complete: {total_bytes/(1024*1024):.2f}MB in {chunk_count} chunks")
+            
+            # Stream to Deepgram
+            async with session.post(DEEPGRAM_API_URL, headers=headers, data=file_stream()) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    if not is_production:
+                        logger.error(f"❌ Deepgram API error: {response.status}, {error_text}")
+                    raise HTTPException(status_code=500, detail=f"Error transcribing audio: {error_text}")
+                
+                data = await response.json()
+                
+                if not is_production:
+                    stream_end = time.time()
+                    stream_time = stream_end - stream_start
+                    total_time = stream_end - start_time
+                    logger.info(f"⚡ Deepgram response received in {stream_time:.2f}s")
+                    logger.info(f"🏁 Total processing time: {total_time:.2f}s")
+                
+                # Quick transcription extraction (optimized for both modes)
+                utterances = data.get("results", {}).get("utterances", [])
+                if utterances:
+                    if not is_production:
+                        logger.info(f"🎯 Found {len(utterances)} utterances")
+                    
+                    # Fast list comprehension instead of loop
+                    formatted_transcription = "\n".join([
+                        f"Speaker {u.get('speaker', 0)}: {u.get('transcript', '').strip()}"
+                        for u in utterances if u.get('transcript', '').strip()
+                    ])
+                else:
+                    # Fallback to regular transcription
+                    channels = data.get("results", {}).get("channels", [])
+                    if channels:
                         transcript = channels[0].get("alternatives", [{}])[0].get("transcript", "")
                         formatted_transcription = f"Speaker 0: {transcript}"
-                        logger.warning("No utterances found, using fallback transcription")
-                else:
-                    # Fallback to regular transcription without diarization
-                    transcript = channels[0].get("alternatives", [{}])[0].get("transcript", "")
-                    formatted_transcription = f"Speaker 0: {transcript}"
-                    logger.warning("No utterances in response, using fallback transcription")
+                    else:
+                        raise HTTPException(status_code=500, detail="No transcription channels found")
+                    
+                    if not is_production:
+                        logger.warning("⚠️ No utterances found, using fallback")
 
                 if not formatted_transcription.strip():
                     raise HTTPException(status_code=500, detail="Failed to get transcription from Deepgram")
                 
-                logger.info(f"Transcription completed successfully")
-                logger.info(f"Transcription length: {len(formatted_transcription)} characters")
-                logger.info(f"Audio processing efficiency: {len(formatted_transcription)/file_size_mb:.0f} chars/MB")
-                logger.info(f"=== END AUDIO PROCESSING ===")
+                if not is_production:
+                    logger.info(f"✨ Transcription success: {len(formatted_transcription)} characters")
+                    logger.info(f"=== END AUDIO PROCESSING ===")
                 
                 return TranscriptionResponse(transcription=formatted_transcription.strip())
                 
-            except Exception as e:
-                logger.error(f"Error processing transcription: {e}")
-                raise HTTPException(status_code=500, detail="Error processing transcription")
+    except Exception as e:
+        if not is_production:
+            logger.error(f"❌ Error in transcription: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
 
 # ─── Classify Speakers as Doctor/Patient ─────────────────────────────────────────────
 @app.post("/classify_speakers", response_model=SpeakerClassificationResponse)
