@@ -145,10 +145,11 @@ async def transcribe_audio(file: UploadFile = File(...)):
     Endpoint to receive audio file and perform transcription via Deepgram with speaker diarization.
     Supports multiple audio formats including compressed formats.
     """
+    logger.info(f"=== AUDIO PROCESSING  ===")
     audio_content = await file.read()
     file_size_mb = len(audio_content) / 1024 / 1024
     
-    logger.info(f"=== AUDIO PROCESSING ===")
+    logger.info(f"=== AUDIO PROCESSING Recevie ===")
     logger.info(f"Received audio file: {file.filename}")
     logger.info(f"File size: {file_size_mb:.2f} MB ({len(audio_content):,} bytes)")
     logger.info(f"Content type: {file.content_type}")
