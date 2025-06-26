@@ -2,10 +2,12 @@ import os
 import json
 import logging
 import aiohttp
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import time
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────────
 import sys
@@ -27,12 +29,24 @@ logger = logging.getLogger("server")
 uvicorn_logger = logging.getLogger("uvicorn")
 uvicorn_logger.setLevel(log_level)
 
+# Suppress verbose third-party library logs
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("aiofiles").setLevel(logging.WARNING)
+
 # Ensure aiohttp and other libraries don't flood logs in production
 if os.getenv("ENVIRONMENT") == "production":
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("multipart").setLevel(logging.WARNING)
+    logging.getLogger("python_multipart.multipart").setLevel(logging.WARNING)
 else:
     logging.getLogger("aiohttp").setLevel(logging.INFO)
+    # Suppress verbose multipart logs even in development
+    logging.getLogger("python_multipart.multipart").setLevel(logging.WARNING)
+    logging.getLogger("multipart").setLevel(logging.WARNING)
+
+# Completely disable multipart debug logs by setting to CRITICAL
+logging.getLogger("python_multipart.multipart").setLevel(logging.CRITICAL)
 
 # ─── Load API Keys ────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -52,6 +66,29 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+# Configure file upload limits and timeouts
+from starlette.middleware.base import BaseHTTPMiddleware
+import asyncio
+
+class FileUploadMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/transcribe_audio" and request.method == "POST":
+            upload_start = time.time()
+            logger.info(f"🔄 Upload middleware: Request started at {time.strftime('%H:%M:%S.%f')[:-3]}")
+            logger.info(f"📊 Content-Length: {request.headers.get('content-length', 'unknown')}")
+            logger.info(f"🌐 Content-Type: {request.headers.get('content-type', 'unknown')}")
+        
+        response = await call_next(request)
+        
+        if request.url.path == "/transcribe_audio" and request.method == "POST":
+            upload_end = time.time()
+            total_middleware_time = upload_end - upload_start
+            logger.info(f"✅ Upload middleware: Total request time {total_middleware_time:.2f}s")
+        
+        return response
+
+app.add_middleware(FileUploadMiddleware)
 
 # CORS middleware to allow frontend access from localhost
 app.add_middleware(
@@ -145,19 +182,67 @@ async def transcribe_audio(file: UploadFile = File(...)):
     Endpoint to receive audio file and perform transcription via Deepgram with speaker diarization.
     Supports multiple audio formats including compressed formats.
     """
-    logger.info(f"=== AUDIO PROCESSING  ===")
-    audio_content = await file.read()
-    file_size_mb = len(audio_content) / 1024 / 1024
+    import time
+    import asyncio
     
-    logger.info(f"=== AUDIO PROCESSING Recevie ===")
-    logger.info(f"Received audio file: {file.filename}")
-    logger.info(f"File size: {file_size_mb:.2f} MB ({len(audio_content):,} bytes)")
+    # Log immediately when endpoint is hit
+    start_time = time.time()
+    endpoint_start = time.strftime('%H:%M:%S.%f')[:-3]
+    logger.info("=== AUDIO PROCESSING STARTED ===")
+    logger.info(f"Endpoint hit at: {endpoint_start}")
+    logger.info(f"Request received for file: {file.filename}")
     logger.info(f"Content type: {file.content_type}")
     
-    # Log transfer efficiency
-    if file_size_mb > 0:
-        transfer_rate = file_size_mb / 1  # Assume 1 second for demo (you can track actual time)
-        logger.info(f"Estimated transfer rate: {transfer_rate:.2f} MB/s")
+    try:
+        # Check file size before reading (if available)
+        file_size = getattr(file, 'size', None)
+        if file_size:
+            logger.info(f"File size from header: {file_size / (1024*1024):.2f} MB")
+        
+        # Read file in chunks to track progress
+        logger.info("Starting file read with progress tracking...")
+        read_start = time.time()
+        
+        chunk_size = 1024 * 1024  # 1MB chunks
+        audio_content = bytearray()
+        bytes_read = 0
+        
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            
+            audio_content.extend(chunk)
+            bytes_read += len(chunk)
+            
+            # Log progress every 5MB
+            if bytes_read % (5 * 1024 * 1024) == 0:
+                elapsed = time.time() - read_start
+                speed = (bytes_read / (1024*1024)) / elapsed if elapsed > 0 else 0
+                logger.info(f"Read {bytes_read/(1024*1024):.1f}MB so far, speed: {speed:.1f}MB/s")
+        
+        read_end = time.time()
+        file_size_mb = len(audio_content) / (1024 * 1024)
+        read_time = read_end - read_start
+        
+        logger.info(f"✅ File read completed!")
+        logger.info(f"📁 Total file size: {file_size_mb:.2f} MB ({len(audio_content):,} bytes)")
+        logger.info(f"⏱️  Read time: {read_time:.2f} seconds")
+        logger.info(f"🚀 Read speed: {file_size_mb/read_time:.2f} MB/s")
+        
+        # Log total time from endpoint call to file ready
+        total_time = time.time() - start_time
+        logger.info(f"⚡ Total time from endpoint call to file ready: {total_time:.2f} seconds")
+        
+        if total_time > 10:
+            logger.warning(f"⚠️  Slow upload detected: {total_time:.2f}s - check network connection")
+    
+    except Exception as e:
+        logger.error(f"❌ Error reading file: {e}")
+        raise HTTPException(status_code=500, detail=f"Error reading uploaded file: {str(e)}")
+    
+    # Convert back to bytes for processing
+    audio_content = bytes(audio_content)
     
     # Determine audio format and set appropriate content type for Deepgram
     content_type = "audio/wav"  # Default
@@ -457,5 +542,11 @@ if __name__ == "__main__":
         reload=False,  # Disable reload for production
         access_log=True,
         use_colors=False,  # Disable colors for cloud logs
-        loop="asyncio"  # Specify event loop for better cloud compatibility
+        loop="asyncio",  # Specify event loop for better cloud compatibility
+        # Optimize for file uploads
+        limit_max_requests=1000,
+        backlog=2048,
+        # Increase timeout for large file uploads
+        timeout_keep_alive=65,
+        h11_max_incomplete_event_size=16777216,  # 16MB for large uploads
     )
