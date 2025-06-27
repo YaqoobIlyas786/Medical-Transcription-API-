@@ -226,7 +226,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
             if is_production:
                 # Production: Maximum speed, minimal logging
                 async def file_stream():
-                    while chunk := await file.read(16384):  # 16KB chunks for speed
+                    while chunk := await file.read(65536):  # 16KB chunks for speed
                         yield chunk
             else:
                 # Development: Progress tracking
