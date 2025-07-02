@@ -3,11 +3,16 @@ import json
 import logging
 import aiohttp
 import time
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+import uuid
+from datetime import datetime, timedelta
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from azure.storage.blob import BlobSasPermissions, generate_blob_sas
+from azure.storage.blob.aio import BlobServiceClient
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────────
 import sys
@@ -52,11 +57,16 @@ logging.getLogger("python_multipart.multipart").setLevel(logging.CRITICAL)
 load_dotenv()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+AZURE_CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME", "uploads")
 
 if not DEEPGRAM_API_KEY or not OPENAI_API_KEY:
     raise RuntimeError("API keys not set in .env")
+
+if not AZURE_STORAGE_CONNECTION_STRING:
+    raise RuntimeError("Azure Storage connection string not set in .env")
     
-logger.info("Loaded Deepgram key and OpenAI key")
+logger.info("Loaded Deepgram key, OpenAI key, and Azure Storage connection string")
 
 # ─── FastAPI Setup ───────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -75,7 +85,8 @@ class FileUploadMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.url.path == "/transcribe_audio" and request.method == "POST":
             upload_start = time.time()
-            logger.info(f"🔄 Upload middleware: Request started at {time.strftime('%H:%M:%S.%f')[:-3]}")
+            current_time = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            logger.info(f"🔄 Upload middleware: Request started at {current_time}")
             logger.info(f"📊 Content-Length: {request.headers.get('content-length', 'unknown')}")
             logger.info(f"🌐 Content-Type: {request.headers.get('content-type', 'unknown')}")
         
@@ -93,14 +104,21 @@ app.add_middleware(FileUploadMiddleware)
 # CORS middleware to allow frontend access from localhost
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080", "http://localhost:3000", "*"],
+    allow_origins=[
+        "http://localhost:5173",  # Vite dev server
+        "http://127.0.0.1:5173",  # Vite dev server alternative
+        "http://localhost:8080", 
+        "http://127.0.0.1:8080", 
+        "http://localhost:3000",
+        "*"  # Allow all origins for development
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # ─── Deepgram API URL ────────────────────────────────────────────────────────────
-DEEPGRAM_API_URL = "https://api.deepgram.com/v1/listen?model=nova-2&punctuate=true&diarize=true&smart_format=true&interim_results=false&utterances=true"
+DEEPGRAM_API_URL = os.getenv("DEEPGRAM_API_URL", "https://api.deepgram.com/v1/listen?model=nova-2&punctuate=true&diarize=true&smart_format=true&interim_results=false&utterances=true")
 
 # ─── OpenAI API URL ──────────────────────────────────────────────────────────────
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
@@ -124,6 +142,10 @@ class SOAPNotesResponse(BaseModel):
 class TranscriptionRequest(BaseModel):
     transcription: str
 
+class UploadUrlResponse(BaseModel):
+    upload_url: str
+    blob_url: str
+
 # ─── Root Endpoint ──────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
@@ -135,7 +157,10 @@ async def root():
         "version": "1.0.0",
         "status": "active",
         "endpoints": {
-            "POST /transcribe_audio": "Upload audio file for transcription (auto-optimized for production)",
+            "GET /generate_upload_url": "Generate pre-signed Azure Blob SAS URL for file upload",
+            "POST /upload_to_blob": "Upload file directly to Azure Blob Storage via backend (CORS-free)",
+            "POST /transcribe_audio_from_blob": "Transcribe audio from Azure Blob Storage URL",
+            "POST /transcribe_audio": "Upload audio file for transcription (legacy endpoint)",
             "POST /classify_speakers": "Classify speakers as Doctor/Patient in transcription",
             "POST /classify_or_summarize": "Get clinical summary and classification",
             "POST /generate_soap": "Generate SOAP notes from transcription"
@@ -174,6 +199,215 @@ async def test_logs():
         "timestamp": "2025-06-26",
         "environment": os.getenv("ENVIRONMENT", "local")
     }
+
+# ─── Generate Upload URL for Azure Blob Storage ──────────────────────────────────
+@app.get("/generate_upload_url", response_model=UploadUrlResponse)
+async def generate_upload_url(filename: str = Query(..., description="The name of the file to upload")):
+    """
+    Generate a pre-signed Azure Blob Storage SAS URL for direct file upload.
+    Returns both the upload URL (with SAS token) and the blob URL (without SAS token).
+    """
+    try:
+        # Generate unique blob name with UUID prefix
+        blob_name = f"{uuid.uuid4()}_{filename}"
+        
+        # Create blob service client
+        blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        blob_client = blob_service.get_blob_client(container=AZURE_CONTAINER_NAME, blob=blob_name)
+        
+        # Generate SAS token with write permissions, expires in 15 minutes
+        sas_token = generate_blob_sas(
+            account_name=blob_client.account_name,
+            container_name=blob_client.container_name,
+            blob_name=blob_client.blob_name,
+            account_key=blob_service.credential.account_key,
+            permission=BlobSasPermissions(write=True),
+            expiry=datetime.utcnow() + timedelta(minutes=15)
+        )
+        
+        # Construct URLs
+        upload_url = f"{blob_client.url}?{sas_token}"
+        blob_url = blob_client.url
+        
+        logger.info(f"Generated upload URL for file: {filename} -> {blob_name}")
+        
+        return UploadUrlResponse(upload_url=upload_url, blob_url=blob_url)
+        
+    except Exception as e:
+        logger.error(f"Error generating upload URL: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating upload URL: {str(e)}")
+
+# ─── Transcribe Audio from Azure Blob Storage ───────────────────────────────────
+@app.post("/transcribe_audio_from_blob", response_model=TranscriptionResponse)
+async def transcribe_audio_from_blob(blob_url: str = Query(..., description="The Azure Blob Storage URL of the audio file")):
+    """
+    Transcribe audio file from Azure Blob Storage using Deepgram API.
+    Downloads the file from Azure using authenticated access and streams it directly to Deepgram for transcription.
+    """
+    import time
+    
+    # Check if we're in production mode for speed optimization
+    is_production = os.getenv("ENVIRONMENT") == "production"
+    
+    if not is_production:
+        # Development mode - detailed logging
+        start_time = time.time()
+        logger.info("=== BLOB AUDIO PROCESSING STARTED ===")
+        logger.info(f"🔗 Processing blob URL: {blob_url}")
+    
+    try:
+        # Determine content type from URL if possible
+        content_type = "audio/wav"  # Default
+        if blob_url:
+            if '.webm' in blob_url:
+                content_type = "audio/webm"
+            elif '.mp4' in blob_url or '.m4a' in blob_url:
+                content_type = "audio/mp4"
+            elif '.ogg' in blob_url:
+                content_type = "audio/ogg"
+            elif '.flac' in blob_url:
+                content_type = "audio/flac"
+        
+        if not is_production:
+            logger.info(f"🔧 Using content type: {content_type}")
+        
+        # Create Azure blob client for authenticated access
+        blob_service = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        
+        # Extract container and blob name from URL
+        # URL format: https://account.blob.core.windows.net/container/blob_name
+        url_parts = blob_url.split('/')
+        container_name = url_parts[-2]
+        blob_name = url_parts[-1]
+        blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+        
+        if not is_production:
+            logger.info("📥 Downloading from Azure Blob Storage using authenticated client...")
+            download_start = time.time()
+        
+        # Get blob properties to check if it exists and get size
+        blob_properties = await blob_client.get_blob_properties()
+        blob_size = blob_properties.size
+        
+        if not is_production:
+            logger.info(f"📊 File size: {blob_size/(1024*1024):.2f}MB")
+            logger.info("📡 Streaming to Deepgram...")
+            stream_start = time.time()
+        
+        # Set up session with appropriate timeout
+        timeout = aiohttp.ClientTimeout(total=180 if is_production else 300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Step 2: Stream directly to Deepgram
+            headers = {
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": content_type
+            }
+            
+            # Create async generator to stream blob content to Deepgram
+            async def blob_stream():
+                total_bytes = 0
+                chunk_count = 0
+                chunk_size = 65536  # 64KB chunks
+                
+                # For large files, use true streaming to save memory
+                if blob_size > 50 * 1024 * 1024:  # If file > 50MB, use streaming
+                    if not is_production:
+                        logger.info("🚀 Using memory-efficient streaming for large file")
+                    
+                    # Stream blob content in chunks
+                    offset = 0
+                    while offset < blob_size:
+                        # Calculate chunk size for this iteration
+                        current_chunk_size = min(chunk_size, blob_size - offset)
+                        
+                        # Download a specific range of the blob
+                        blob_data = await blob_client.download_blob(offset=offset, length=current_chunk_size)
+                        chunk = await blob_data.readall()
+                        
+                        total_bytes += len(chunk)
+                        chunk_count += 1
+                        offset += len(chunk)
+                        
+                        # Log progress in development mode
+                        if not is_production and chunk_count % 50 == 0:
+                            logger.info(f"📤 Streamed {total_bytes/(1024*1024):.1f}MB to Deepgram...")
+                        
+                        yield chunk
+                else:
+                    # For smaller files, download all at once then chunk
+                    if not is_production:
+                        logger.info("🚀 Using single-download approach for smaller file")
+                    
+                    blob_data = await blob_client.download_blob()
+                    content = await blob_data.readall()
+                    
+                    # Yield content in chunks for streaming
+                    for i in range(0, len(content), chunk_size):
+                        chunk = content[i:i + chunk_size]
+                        total_bytes += len(chunk)
+                        chunk_count += 1
+                        
+                        # Log progress in development mode
+                        if not is_production and chunk_count % 50 == 0:
+                            logger.info(f"📤 Streamed {total_bytes/(1024*1024):.1f}MB to Deepgram...")
+                        
+                        yield chunk
+                
+                if not is_production:
+                    logger.info(f"✅ Stream complete: {total_bytes/(1024*1024):.2f}MB in {chunk_count} chunks")
+            
+            # Stream to Deepgram
+            async with session.post(DEEPGRAM_API_URL, headers=headers, data=blob_stream()) as deepgram_response:
+                if deepgram_response.status != 200:
+                    error_text = await deepgram_response.text()
+                    logger.error(f"❌ Deepgram API error: {deepgram_response.status}, {error_text}")
+                    raise HTTPException(status_code=500, detail=f"Deepgram error: {error_text}")
+                
+                data = await deepgram_response.json()
+                
+                if not is_production:
+                    stream_end = time.time()
+                    stream_time = stream_end - stream_start
+                    total_time = stream_end - start_time
+                    logger.info(f"⚡ Deepgram response received in {stream_time:.2f}s")
+                    logger.info(f"🏁 Total processing time: {total_time:.2f}s")
+                
+                # Process transcription response (same logic as original endpoint)
+                utterances = data.get("results", {}).get("utterances", [])
+                if utterances:
+                    if not is_production:
+                        logger.info(f"🎯 Found {len(utterances)} utterances")
+                    
+                    # Fast list comprehension for formatting
+                    formatted_transcription = "\n".join([
+                        f"Speaker {u.get('speaker', 0)}: {u.get('transcript', '').strip()}"
+                        for u in utterances if u.get('transcript', '').strip()
+                    ])
+                else:
+                    # Fallback to regular transcription
+                    channels = data.get("results", {}).get("channels", [])
+                    if channels:
+                        transcript = channels[0].get("alternatives", [{}])[0].get("transcript", "")
+                        formatted_transcription = f"Speaker 0: {transcript}"
+                    else:
+                        raise HTTPException(status_code=500, detail="No transcription channels found")
+                    
+                    if not is_production:
+                        logger.warning("⚠️ No utterances found, using fallback")
+                
+                if not formatted_transcription.strip():
+                    raise HTTPException(status_code=500, detail="Failed to get transcription from Deepgram")
+                
+                if not is_production:
+                    logger.info(f"✨ Transcription success: {len(formatted_transcription)} characters")
+                    logger.info("=== END BLOB AUDIO PROCESSING ===")
+                
+                return TranscriptionResponse(transcription=formatted_transcription.strip())
+                    
+    except Exception as e:
+        if not is_production:
+            logger.error(f"❌ Error in blob transcription: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing blob: {str(e)}")
 
 # ─── Transcribe Audio Using Deepgram ───────────────────────────────────────────────
 @app.post("/transcribe_audio", response_model=TranscriptionResponse)
